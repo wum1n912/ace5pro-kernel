@@ -1,0 +1,333 @@
+name: Build Ace5Pro SukiSU Kernel (COS16)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_branch:
+        description: 'SukiSU 分支'
+        required: true
+        type: string
+        default: 'builtin'
+      enable_susfs:
+        description: '启用 SUSFS'
+        type: boolean
+        default: true
+      enable_kpm:
+        description: '启用 KPM'
+        type: boolean
+        default: true
+      enable_bbg:
+        description: '启用 Baseband-Guard'
+        type: boolean
+        default: true
+      enable_fengchi:
+        description: '启用风驰调度器(hmbird) - 必开'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_VERSION: android15
+  KERNEL_VERSION: "6.6"
+  BRANCH: oneplus/sm8750_b_16.0.0_oneplus_ace5_pro
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 检出构建仓库
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: 最大化磁盘
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          swap-size-mb: 16384
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+
+      - name: 环境信息
+        run: |
+          echo "=== 磁盘 ==="; df -h /
+          echo "=== 内存 ==="; free -h
+          echo "=== CPU ==="; nproc
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev python3 \
+            cpio dwarves zip unzip curl git patch rsync gawk dos2unix \
+            libncurses-dev liblz4-tool zlib1g-dev libxml2-utils
+
+      - name: 安装 repo 工具
+        run: |
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
+          chmod a+x /usr/local/bin/repo
+          repo --version | head -2
+
+      - name: 拉取内核源码
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/src" && cd "$GITHUB_WORKSPACE/src"
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b oneplus/sm8750 -m oneplus_ace5_pro_b.xml --depth=1
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle --force-sync
+          echo "=== 同步完成 ==="
+          ls
+          echo "=== 内核版本 ==="
+          sed -n '1,4p' kernel_platform/common/Makefile
+
+      - name: 清理版本串与 ABI 导出表
+        run: |
+          cd $GITHUB_WORKSPACE/src/kernel_platform
+          rm -f common/android/abi_gki_protected_exports_* || true
+          rm -f msm-kernel/android/abi_gki_protected_exports_* || true
+          for f in common/scripts/setlocalversion msm-kernel/scripts/setlocalversion; do
+            [ -f "$f" ] && sed -i 's/ -dirty//g' "$f"
+          done
+
+      - name: 安装 AOSP Clang r510928
+        run: |
+          curl -L --retry 3 -o /tmp/clang.tar.gz \
+            https://github.com/s1lently/llvm-project/releases/download/r510928-arm64/aosp-clang-r510928-x86_64-kernel.tar.gz
+          mkdir -p $HOME/clang
+          tar xzf /tmp/clang.tar.gz -C /tmp
+          for d in /tmp/clang-kernel-only /tmp/clang; do
+            if [ -x "$d/bin/clang" ]; then cp -a "$d"/. $HOME/clang/; break; fi
+          done
+          [ -x "$HOME/clang/bin/clang" ] || { echo "::error::clang 未解出"; ls /tmp; exit 1; }
+          echo "$HOME/clang/bin" >> $GITHUB_PATH
+          "$HOME/clang/bin/clang" --version | head -3
+
+      - name: 打风驰补丁（Ace5Pro COS16 专用）
+        if: inputs.enable_fengchi
+        run: |
+          cd $GITHUB_WORKSPACE/src/kernel_platform/common
+          curl -sSL --retry 3 -o /tmp/fengchi.patch \
+            https://raw.githubusercontent.com/Numbersf/SCHED_PATCH/sm8750/fengchi_oneplus_ace5_pro_b.patch
+          echo "补丁: $(wc -c < /tmp/fengchi.patch) 字节"
+          dos2unix /tmp/fengchi.patch
+          patch -p1 -F 3 --no-backup-if-mismatch < /tmp/fengchi.patch
+          echo "=== 核对 ==="
+          test -f kernel/sched/hmbird/hmbird.c || { echo "::error::hmbird.c 未生成"; exit 1; }
+          grep -q "CONFIG_HMBIRD_SCHED=y" arch/arm64/configs/gki_defconfig \
+            || { echo "::error::defconfig 未切到 HMBIRD_SCHED"; exit 1; }
+          echo "  ✅ 风驰补丁应用成功"
+
+      - name: 集成 SukiSU + SUSFS
+        run: |
+          cd $GITHUB_WORKSPACE/src/kernel_platform
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s "${{ inputs.ksu_branch }}"
+          cd KernelSU
+          echo "=== SukiSU 版本 ==="
+          git log -1 --oneline
+          KSU_VER=$(expr $(git rev-list --count HEAD) "+" 30700)
+          echo "KSUVER=$KSU_VER" >> $GITHUB_ENV
+          echo "KSU 版本号: $KSU_VER"
+
+      - name: 打 SUSFS 内核补丁
+        if: inputs.enable_susfs
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth 1 -b gki-android15-6.6 https://gitlab.com/simonpunk/susfs4ksu.git susfs
+          cd src/kernel_platform/common
+          cp ../../../susfs/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch .
+          cp ../../../susfs/kernel_patches/fs/* fs/
+          cp ../../../susfs/kernel_patches/include/linux/* include/linux/
+          echo "=== 应用 SUSFS 补丁 ==="
+          if ! patch -p1 --forward --no-backup-if-mismatch < 50_add_susfs_in_gki-android15-6.6.patch; then
+            echo "::error::SUSFS 补丁失败"
+            exit 1
+          fi
+          grep -q "susfs" fs/Makefile || { echo "::error::SUSFS 未进 fs/Makefile"; exit 1; }
+          echo "  ✅ SUSFS 补丁应用成功"
+
+      - name: 集成 Baseband-Guard
+        if: inputs.enable_bbg
+        run: |
+          cd $GITHUB_WORKSPACE/src/kernel_platform/common
+          curl -sSL https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh -o bbg_setup.sh
+          sh bbg_setup.sh
+          echo "=== 核对 ==="
+          grep -q "baseband-guard" security/Makefile || { echo "::error::BBG 未进 security/Makefile"; exit 1; }
+          echo "  ✅ BBG 集成成功"
+
+      - name: 配置内核选项
+        run: |
+          cd $GITHUB_WORKSPACE/src/kernel_platform/common
+          D=arch/arm64/configs/gki_defconfig
+          # 精确匹配：$1 整行已存在则跳过（避免 CONFIG_LOCALVERSION 误匹配 CONFIG_LOCALVERSION_AUTO）
+          add() { grep -qxF "$1" "$D" || echo "$1" >> "$D"; }
+          setn() { sed -i "s|^$1=.*|$1=$2|" "$D"; }
+
+          echo "=== KSU 基础 ==="
+          add "CONFIG_KSU=y"
+          add 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@ace5pro"'
+          add "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y"
+
+          if [ "${{ inputs.enable_kpm }}" = "true" ]; then
+            echo "=== KPM ==="
+            add "CONFIG_KPM=y"
+          fi
+
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            echo "=== SUSFS ==="
+            for c in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
+                     KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                     KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
+              add "CONFIG_${c}=y"
+            done
+          fi
+
+          if [ "${{ inputs.enable_bbg }}" = "true" ]; then
+            echo "=== BBG ==="
+            add "CONFIG_BBG=y"
+            setn 'CONFIG_LSM' '"landlock,lockdown,yama,loadpin,safesetid,integrity,selinux,apparmor,bpf,baseband_guard"'
+          fi
+
+          echo "=== BBR + fq ==="
+          add "CONFIG_TCP_CONG_ADVANCED=y"
+          add "CONFIG_TCP_CONG_BBR=y"
+          add "CONFIG_NET_SCH_FQ=y"
+          add "CONFIG_DEFAULT_BBR=y"
+
+          echo "=== zram：保持与原厂一致为模块（16G 由用户层设 disksize）==="
+          # 原厂 CONFIG_ZRAM=m / ZSMALLOC=m，且 vendor_dlkm 里有
+          # oplus_bsp_hybridswap_zram.ko / oplus_bsp_zram_opt.ko / oplus_bsp_zsmalloc.ko
+          # 依赖 zram 符号。改成 =y 会让这几个 .ko 找不到符号或行为异常。
+          setn "CONFIG_ZRAM" "m"
+          add "CONFIG_ZRAM_WRITEBACK=y"
+          add "CONFIG_ZRAM_MULTI_COMP=y"
+          add "CONFIG_ZRAM_DEF_COMP_LZ4=y"
+          add 'CONFIG_ZRAM_DEF_COMP="lz4"'
+          add "CONFIG_CRYPTO_LZ4=y"
+          add "CONFIG_CRYPTO_LZ4HC=y"
+          add "CONFIG_CRYPTO_ZSTD=y"
+
+          echo "=== 对齐原厂 vermagic（关键！）==="
+          # 原厂内核串: 6.6.118-android15-8-g93e223c276e7-abogki500782043-4k
+          # vermagic : 6.6.118-android15-8-g93e223c276e7-abogki500782043-4k SMP preempt mod_unload modversions aarch64
+          #
+          # 做法: 把完整后缀硬编码进 CONFIG_LOCALVERSION，并关掉 LOCALVERSION_AUTO，
+          # 这样 scripts/setlocalversion 不会再追加 -g<hash>，串逐字节等于原厂。
+          # 若保留 AUTO=y，串会变成 6.6.118-android15-8-g<自己的sha>-abogki<自己>-4k，
+          # 与原厂不同 -> vermagic 不匹配 -> vendor_dlkm 里 1398 个厂商模块全部拒绝加载。
+          sed -i '/^CONFIG_LOCALVERSION=/d' "$D"
+          add 'CONFIG_LOCALVERSION="-android15-8-g93e223c276e7-abogki500782043-4k"'
+          sed -i '/^CONFIG_LOCALVERSION_AUTO=/d' "$D"
+          add "CONFIG_LOCALVERSION_AUTO=n"
+          add "CONFIG_MODULE_SCMVERSION=y"
+
+          echo "=== O2 ==="
+          add "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y"
+
+          sed -i 's/check_defconfig//' build.config.gki || true
+          echo "=== defconfig 关键行 ==="
+          grep -nE "KSU|KPM|SUSFS|BBG|HMBIRD|ZRAM|BBR|LSM=" "$D" | head -40
+
+      - name: 生成配置
+        run: |
+          cd $GITHUB_WORKSPACE/src/kernel_platform/common
+          export PATH="$HOME/clang/bin:$PATH"
+          export LOCALVERSION=""
+          make -j$(nproc) LLVM=1 LLVM_IAS=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            LOCALVERSION="$LOCALVERSION" \
+            KCFLAGS=-Wno-error gki_defconfig
+          echo "=== auto.conf 里的 LOCALVERSION ==="
+          grep -E "^CONFIG_LOCALVERSION" out/include/config/auto.conf || true
+          echo "=== 版本串（setlocalversion 实测输出）==="
+          make -s O=out LOCALVERSION="$LOCALVERSION" ARCH=arm64 kernelrelease 2>/dev/null \
+            || echo "(kernelrelease 目标失败，编译后再验)"
+          echo "LOCALVERSION=$LOCALVERSION" >> $GITHUB_ENV
+
+      - name: 配置校验
+        run: |
+          cd $GITHUB_WORKSPACE/src/kernel_platform/common
+          FAIL=0
+          chk() { grep -qE "^CONFIG_${1}=y" out/.config && echo "  [OK]   $1" || { echo "  [FAIL] $1"; FAIL=1; }; }
+          echo "=== 必须为 y ==="
+          chk HMBIRD_SCHED
+          chk MODVERSIONS
+          chk KSU
+          [ "${{ inputs.enable_kpm }}" = "true" ] && chk KPM
+          [ "${{ inputs.enable_susfs }}" = "true" ] && chk KSU_SUSFS
+          [ "${{ inputs.enable_bbg }}" = "true" ] && chk BBG
+          chk TCP_CONG_BBR
+          echo "=== 必须不为 y ==="
+          for c in SLIM_SCHED SCHED_CLASS_EXT; do
+            grep -qE "^CONFIG_${c}=y" out/.config && { echo "  [FAIL] $c 不应开启"; FAIL=1; } || echo "  [OK]   $c 未开启"
+          done
+          [ "$FAIL" -ne 0 ] && { echo "::error::配置校验失败"; exit 1; }
+
+          echo "=== vermagic 断言（必须逐字节等于原厂）==="
+          REL=$(cat out/include/config/kernel.release 2>/dev/null || true)
+          EXPECT="6.6.118-android15-8-g93e223c276e7-abogki500782043-4k"
+          if [ "$REL" != "$EXPECT" ]; then
+            echo "::error::kernel.release 不匹配: 实际='$REL' 期望='$EXPECT'"
+            echo "厂商模块将全部无法加载，中止。"
+            exit 1
+          fi
+          echo "  [OK] kernel.release = $REL"
+          echo "✅ 配置校验通过"
+
+      - name: 编译内核
+        run: |
+          cd $GITHUB_WORKSPACE/src/kernel_platform/common
+          export PATH="$HOME/clang/bin:$PATH"
+          export KBUILD_BUILD_USER=ace5pro
+          export KBUILD_BUILD_HOST=build
+          time make -j$(nproc) LLVM=1 LLVM_IAS=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            LOCALVERSION="$LOCALVERSION" \
+            KCFLAGS=-Wno-error Image modules
+          echo "=== 产物 ==="
+          ls -lh out/arch/arm64/boot/Image
+          echo "=== 内核版本 ==="
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
+
+      - name: 打包 AnyKernel3
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth 1 https://github.com/cctv18/AnyKernel3.git ak3
+          rm -rf ak3/.git
+          cp src/kernel_platform/common/out/arch/arm64/boot/Image ak3/Image
+          cd ak3
+          sed -i 's/^BLOCK=.*/BLOCK=boot/' anykernel.sh
+          sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
+          sed -i "s/^kernel.string=.*/kernel.string=Ace5Pro SukiSU 6.6.118 (SUSFS+KPM+BBG+fengchi)/" anykernel.sh
+          grep -E "^BLOCK=|^IS_SLOT_DEVICE=|^kernel.string=" anykernel.sh
+          cd ..
+          cd ak3 && zip -r9 ../AK3_Ace5Pro_SukiSU_CO16.zip . > /dev/null && cd ..
+          ls -lh AK3_Ace5Pro_SukiSU_CO16.zip
+
+      - name: 打包 16G zram 模块
+        run: |
+          cd $GITHUB_WORKSPACE
+          M=$(mktemp -d)
+          cp -a "$GITHUB_WORKSPACE/repo/zram16g/." "$M"/
+          chmod +x "$M/service.sh" "$M/META-INF/com/google/android/update-binary"
+          ( cd "$M" && zip -r9 "$GITHUB_WORKSPACE/ZRAM16G_Ace5Pro.zip" . > /dev/null )
+          rm -rf "$M"
+          unzip -l ZRAM16G_Ace5Pro.zip
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ace5Pro-SukiSU-Kernel
+          compression-level: 6
+          path: |
+            src/kernel_platform/common/out/arch/arm64/boot/Image
+            AK3_Ace5Pro_SukiSU_CO16.zip
+            ZRAM16G_Ace5Pro.zip
+            src/kernel_platform/common/out/.config
+            src/kernel_platform/common/out/Module.symvers

@@ -1,0 +1,5 @@
+*.o
+*.ko
+out/
+src/
+node_modules/

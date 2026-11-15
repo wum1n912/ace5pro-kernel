@@ -1,0 +1,6 @@
+id=zram16g
+name=ZRAM 16G (Ace5Pro)
+version=v1.0
+versionCode=1
+author=ace5pro-kernel
+description=开机把 zram0 设为 16G + lz4，兼容 OnePlus 原厂 hybridswap 栈
