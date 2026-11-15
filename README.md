@@ -82,3 +82,4 @@ echo 16G > /sys/block/zram0/disksize
 mkswap /dev/block/zram0
 swapon -p 32767 /dev/block/zram0
 ```
+
